@@ -1,0 +1,117 @@
+# Remember to change
+# - Backend definition
+# - vcl_recv req.http.host definition
+# - vcl_fetch req.http.host definition
+#
+# According to your needs
+
+backend local {
+
+	#Make it through nginx ( Internet ===> Varnish:80 ===> Nginx:8081 ===> Apache:8080 )
+	.host = "127.0.0.1";
+	.port = "8081";
+}
+
+sub vcl_recv {
+
+	# Rules for all requests
+	# Only the blog URL is cached
+	if (req.http.host ~ "(blog\.brigato\.fr|www\.brigato\.fr)") { set req.backend = local; }
+	else { return (pass); }
+
+	# Compatiblity with Apache log
+	remove req.http.X-Forwarded-For;
+	set req.http.X-Forwarded-For = client.ip;
+
+	# Post requests will not be cached
+	if (req.request == "POST") {
+	return (pass);
+	}
+
+	# Normalize encoding/compression
+	if (req.http.Accept-Encoding) {
+		if (req.http.Accept-Encoding ~ "gzip") { set req.http.Accept-Encoding = "gzip";	}
+		elsif (req.http.Accept-Encoding ~ "deflate") { set req.http.Accept-Encoding = "deflate"; }
+		else { remove req.http.Accept-Encoding; }
+	}
+
+	# Remove has_js and Google Analytics __* cookies.
+	if (req.http.cookie) {
+		set req.http.Cookie = regsuball(req.http.Cookie, "(^|;\s*)(__[a-z]+|has_js)=[^;]*", "");
+
+		# Remove a ";" prefix, if present.
+		set req.http.Cookie = regsub(req.http.Cookie, "^;\s*", "");
+
+		# Remove empty cookies.
+		if (req.http.Cookie ~ "^\s*$") {
+		unset req.http.Cookie;
+		}
+	}
+
+	# Serve the page
+	unset req.http.vary;
+
+	# If I am logged in to wordpress, I DO NOT WANT TO SEE cached pages
+	if ( req.url ~ "^/wp-(login|admin)" || req.http.Cookie ~ "wordpress_logged_in_" ) {
+		return (pass);
+		} else {
+	
+		# If I'm just a regular visitor
+		# If the request is static
+		if (req.url ~ "\.(jpeg|jpg|png|gif|ico|js|css|txt|gz|zip|lzma|bz2|tgz|tbz|html|htm)$") {
+			# Remove the cookie and make the request static
+			unset req.http.cookie;
+			return (lookup);
+		}
+
+		# Try to lookup in the cache
+		return (lookup);
+	}
+
+	# Cookie ? Not cacheable by default
+	if (req.http.Authorization || req.http.Cookie) {
+		return (pass);
+	}
+
+	# if host header is empty return 404
+	error 404 req.http.host;
+	return (lookup);
+}
+
+sub vcl_fetch {
+	if (req.http.host ~ "(blog\.brigato\.fr|www\.brigato\.fr)") {
+		
+		# Do not cache POST requests
+		if (req.request == "POST") {
+			return (pass);
+		}
+
+		# If the request is static
+		if (req.url ~ "\.(jpeg|jpg|png|gif|ico|js|css|txt|gz|zip|lzma|bz2|tgz|tbz|html|htm)$") {
+			# Cache it, and make it last 2 hours
+			set beresp.ttl = 7200s;
+			# Make the request static by removing any cookies set by those static files
+			unset beresp.http.set-cookie;
+			# Deliver the cached object
+			return (deliver);
+		}
+
+		# If I am logged in to wordpress, I DO NOT WANT TO SEE cached pages
+		if (req.http.cookie ~ "wordpress_logged_in") {
+			return (pass);
+		} else {
+
+		# Cache anything for 2 minutes. When the cache expires it will be cached again and again, at the time of the request
+			set beresp.ttl = 120s;
+			return (deliver);
+		}
+	}
+}
+
+sub vcl_deliver {
+	# Secure the header
+	remove resp.http.Via;
+	remove resp.http.X-Varnish;
+	remove resp.http.Server;
+	remove resp.http.X-Powered-By;
+}
